@@ -1,6 +1,17 @@
 import { EventEmitter } from 'node:events';
 import { Connection } from 'jsforce';
-import { StreamingExtension, type Subscription } from 'jsforce/lib/api/streaming.js';
+import {
+  StreamingExtension,
+  type Client,
+  type Subscription,
+} from 'jsforce/lib/api/streaming.js';
+
+/**
+ * jsforce's bundled faye typings omit `disconnect()`, but it exists at runtime
+ * (faye's Client closes its long-poll connection through it). Model just the
+ * method we need rather than casting to `any`.
+ */
+type FayeClient = Client & { disconnect(): void };
 
 /** A channel name as shown in the UI dropdown (without the /event/ prefix). */
 export type ChannelName = string;
@@ -61,6 +72,14 @@ export interface EnrichedMessage {
 export class SalesforceStreamer extends EventEmitter {
   private creds: ConnectParams | null = null;
   private conn: Connection | null = null;
+  /**
+   * One faye client per channel. jsforce's Replay extension writes a
+   * single-channel replay map into the outgoing /meta/subscribe `ext`, and faye
+   * runs every extension on every message — so multiple Replay extensions on
+   * one shared client clobber each other's replay map, breaking subscriptions.
+   * Isolating each channel on its own client keeps replay maps independent.
+   */
+  private clients: FayeClient[] = [];
   private subscriptions: Subscription[] = [];
   private status: StreamStatus = { state: 'disconnected' };
   private reauthTimer: NodeJS.Timeout | null = null;
@@ -125,6 +144,12 @@ export class SalesforceStreamer extends EventEmitter {
     const creds = this.creds;
     if (!creds) throw new Error('No credentials set');
 
+    // Tear down any prior CometD clients/subscriptions before opening new ones.
+    // open() is also reached via reconnectSoon() on re-auth, which does not go
+    // through connect()/disconnect(); without this a reconnect would leak the
+    // previous clients and cause duplicate event delivery.
+    this.teardownClients();
+
     this.setStatus({ state: 'connecting', channels: creds.channels });
 
     const token = await this.fetchToken(creds);
@@ -140,30 +165,26 @@ export class SalesforceStreamer extends EventEmitter {
     // Replay: -1 = new events only, -2 = all retained, N = resume after N.
     const replayId = creds.replayId ?? -1;
 
-    // Each channel gets its own Replay extension (it is channel-specific); the
-    // auth-failure extension is shared and triggers a single re-auth.
-    const authFailureExt = new StreamingExtension.AuthFailure(() => {
-      this.emit('log', 'CometD auth failure — attempting re-auth');
-      void this.reconnectSoon();
-    });
-    const replayExts = creds.channels.map(
-      (channel) =>
-        new StreamingExtension.Replay(this.channelPath(channel), replayId),
-    );
-
-    const fayeClient = conn.streaming.createClient([
-      ...replayExts,
-      authFailureExt,
-    ]);
-
-    // Subscribe to every requested channel over the same CometD client, tagging
-    // each event with the channel it arrived on.
-    this.subscriptions = creds.channels.map((channel) => {
+    // One faye client per channel. Each client carries exactly one Replay
+    // extension (so replay maps never collide) plus its own AuthFailure hook.
+    for (const channel of creds.channels) {
       const path = this.channelPath(channel);
-      return fayeClient.subscribe(path, (message: unknown) => {
-        void this.handleMessage(channel, message);
+      const replayExt = new StreamingExtension.Replay(path, replayId);
+      const authFailureExt = new StreamingExtension.AuthFailure(() => {
+        this.emit('log', `CometD auth failure on ${channel} — re-auth`);
+        void this.reconnectSoon();
       });
-    });
+      const client = conn.streaming.createClient([
+        replayExt,
+        authFailureExt,
+      ]) as FayeClient;
+      this.clients.push(client);
+      this.subscriptions.push(
+        client.subscribe(path, (message: unknown) => {
+          void this.handleMessage(channel, message);
+        }),
+      );
+    }
 
     this.setStatus({
       state: 'connected',
@@ -290,11 +311,13 @@ export class SalesforceStreamer extends EventEmitter {
     }, 1000);
   }
 
-  async disconnect(): Promise<void> {
-    if (this.reauthTimer) {
-      clearTimeout(this.reauthTimer);
-      this.reauthTimer = null;
-    }
+  /**
+   * Cancel all subscriptions and disconnect every CometD client. Cancelling
+   * subscriptions alone leaves each faye client's long-poll connection open;
+   * opening new clients without this leaves the org delivering each event to
+   * every live client — surfacing as a counter that jumps by more than one.
+   */
+  private teardownClients(): void {
     for (const sub of this.subscriptions) {
       try {
         sub.cancel();
@@ -303,6 +326,22 @@ export class SalesforceStreamer extends EventEmitter {
       }
     }
     this.subscriptions = [];
+    for (const client of this.clients) {
+      try {
+        client.disconnect();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.clients = [];
+  }
+
+  async disconnect(): Promise<void> {
+    if (this.reauthTimer) {
+      clearTimeout(this.reauthTimer);
+      this.reauthTimer = null;
+    }
+    this.teardownClients();
     this.conn = null;
     this.creds = null;
     this.tspPolicyNames = null;
